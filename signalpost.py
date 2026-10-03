@@ -1,59 +1,48 @@
 #!/usr/bin/env python3
-"""Signalpost agent: async scraper for Norwegian company data.
+"""Signalpost — challenge-ready scraper for Norwegian company profiles.
 
-Built for the Signalpost hackathon challenge.
-Usage:
-  Official mode (45-min hard cap, 2,000-request cap):
-    python signalpost.py <input_file>
-  
-  Batch mode (pre-generate 1,000+ profiles; auto-extends time if needed):
-    python signalpost.py <input_file> --mode batch
+Run modes:
+  official: fixed 42-minute deadline and 1,900-request cap
+  batch: chunk processing for submission generation; extends time only when needed
 
-Input: JSON, CSV, or newline-delimited text with 9-digit company numbers.
-Deps: pip install -r requirements.txt
+Single command example:
+  python signalpost.py ids.txt
+  python signalpost.py ids.txt --mode batch --chunk-size 1500
 """
 import argparse
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import sys
 import time
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
 from collections import deque
+from datetime import datetime, timezone
 
 import httpx
 
 BASE = "https://data.brreg.no/enhetsregisteret/api"
 ACCOUNTS = "https://data.regnskapsregister.brreg.no/regnskapsregister/regnskap"
 
-# Official mode constraints
-OFFICIAL_TIME_LIMIT = 42 * 60  # 42 minutes
-OFFICIAL_REQUEST_BUDGET = 1900  # leave 100 headroom under 2,000
+OFFICIAL_TIME_LIMIT = 42 * 60
+OFFICIAL_REQUEST_LIMIT = 1900
+DEFAULT_CHUNK_SIZE = 1500
+BATCH_MAX_TIME_EXTENSION = 6 * 60 * 60
 
-# Batch mode defaults (can extend)
-BATCH_INITIAL_TIME = 42 * 60
-BATCH_MAX_TIME_EXTENSION = 6 * 60 * 60  # 6 hours max
-BATCH_THRESHOLD = 1500  # companies
-
-# Concurrency tuning
 CONCURRENCY_START = 8
 CONCURRENCY_MIN = 2
 CONCURRENCY_MAX = 24
-THROTTLE_THRESHOLD_UP = 0.01  # < 1% fail -> increase
-THROTTLE_THRESHOLD_DOWN = 0.05  # > 5% fail -> decrease
-THROTTLE_WINDOW = 100  # re-evaluate every N requests
+THROTTLE_WINDOW = 100
+THROTTLE_DOWN = 0.05
+THROTTLE_UP = 0.01
 
 
-def now():
-    """Return current UTC timestamp in ISO format."""
+def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def load_ids(path):
-    """Accept JSON list, CSV, or newline text. Normalise to 9-digit strings."""
     try:
         raw = open(path, encoding="utf-8").read()
     except FileNotFoundError:
@@ -65,289 +54,201 @@ def load_ids(path):
         if isinstance(data, dict):
             data = next((v for v in data.values() if isinstance(v, list)), [])
         tokens = [
-            str(x.get("orgnr") or x.get("id") or x) if isinstance(x, dict) else str(x)
+            str(x.get("orgnr") or x.get("id") or x)
+            if isinstance(x, dict)
+            else str(x)
             for x in data
         ]
     except json.JSONDecodeError:
         tokens = re.split(r"[\s,;]+", raw)
 
     ids, seen = [], set()
-    for t in tokens:
-        d = re.sub(r"\D", "", t)
-        if len(d) == 9 and d not in seen:
-            seen.add(d)
-            ids.append(d)
-
-    if not ids:
-        print("WARNING: No valid 9-digit org numbers found in input.", file=sys.stderr)
-
+    for token in tokens:
+        digits = re.sub(r"\D", "", token)
+        if len(digits) == 9 and digits not in seen:
+            seen.add(digits)
+            ids.append(digits)
     return ids
 
 
 class Budget:
-    """Track request budget, deadline, and capacity."""
-
-    def __init__(self, mode="official", total_companies=0, initial_time=None):
+    def __init__(self, mode, total_companies, request_limit=OFFICIAL_REQUEST_LIMIT):
         self.mode = mode
+        self.total_companies = total_companies
+        self.request_limit = request_limit
         self.used = 0
-        self.request_limit = OFFICIAL_REQUEST_BUDGET
-        
-        if mode == "official":
-            self.deadline = time.time() + OFFICIAL_TIME_LIMIT
-        else:
-            # Batch mode: start with initial time, may extend
-            initial_time = initial_time or BATCH_INITIAL_TIME
-            self.deadline = time.time() + initial_time
-            self.initial_deadline = self.deadline
-            self.total_companies = total_companies
-            self.may_extend = True
-        
         self.concurrency = CONCURRENCY_START
-        self.throttle_history = deque(maxlen=THROTTLE_WINDOW)
+        self.deadline = time.time() + (OFFICIAL_TIME_LIMIT if mode == "official" else 42 * 60)
+        self.initial_deadline = self.deadline
+        self.throttles = deque(maxlen=THROTTLE_WINDOW)
+        self.max_extension = BATCH_MAX_TIME_EXTENSION
 
-    def take(self, force=False):
-        """Check if a request can be made within budget and time limits."""
-        if not force and (self.used >= self.request_limit or time.time() > self.deadline):
+    def take(self):
+        if self.used >= self.request_limit:
+            return False
+        if time.time() > self.deadline:
             return False
         self.used += 1
         return True
 
-    def remaining(self):
-        """Return remaining requests."""
+    def remaining_requests(self):
         return max(0, self.request_limit - self.used)
 
-    def time_remaining(self):
-        """Return time remaining in seconds."""
-        return max(0, self.deadline - time.time())
+    def time_left(self):
+        return max(0.0, self.deadline - time.time())
 
     def record_throttle(self, was_throttled):
-        """Record whether a request was throttled (for tuning)."""
-        self.throttle_history.append(was_throttled)
-        if len(self.throttle_history) >= THROTTLE_WINDOW:
-            throttle_rate = sum(self.throttle_history) / len(self.throttle_history)
-            if throttle_rate > THROTTLE_THRESHOLD_DOWN and self.concurrency > CONCURRENCY_MIN:
-                self.concurrency = max(CONCURRENCY_MIN, self.concurrency // 2)
-            elif throttle_rate < THROTTLE_THRESHOLD_UP and self.concurrency < CONCURRENCY_MAX:
-                self.concurrency = min(CONCURRENCY_MAX, self.concurrency + 2)
+        self.throttles.append(bool(was_throttled))
+        if len(self.throttles) < THROTTLE_WINDOW:
+            return
+        rate = sum(self.throttles) / len(self.throttles)
+        if rate > THROTTLE_DOWN and self.concurrency > CONCURRENCY_MIN:
+            self.concurrency = max(CONCURRENCY_MIN, self.concurrency // 2)
+        elif rate < THROTTLE_UP and self.concurrency < CONCURRENCY_MAX:
+            self.concurrency = min(CONCURRENCY_MAX, self.concurrency + 2)
 
-    def maybe_extend_time(self, companies_processed, avg_time_per_company):
-        """In batch mode, extend deadline if ETA exceeds current limit."""
-        if self.mode != "batch" or not self.may_extend:
+    def maybe_extend(self, companies_processed, average_step_time):
+        if self.mode != "batch":
             return False
-        
-        if self.total_companies <= BATCH_THRESHOLD:
-            # Small batches don't need extension
+        if self.total_companies <= DEFAULT_CHUNK_SIZE:
             return False
-        
-        remaining_companies = self.total_companies - companies_processed
-        estimated_remaining_time = remaining_companies * avg_time_per_company
-        time_available = self.deadline - time.time()
-        
-        if estimated_remaining_time > time_available:
-            # Need to extend
-            extension = min(
-                estimated_remaining_time - time_available,
-                BATCH_MAX_TIME_EXTENSION - (self.deadline - self.initial_deadline)
-            )
-            if extension > 0:
-                self.deadline += extension
+        remaining = self.total_companies - companies_processed
+        if remaining <= 0:
+            return False
+        time_remaining = self.deadline - time.time()
+        estimated_remaining = remaining * average_step_time
+        if estimated_remaining > time_remaining:
+            need = estimated_remaining - time_remaining
+            max_extra = self.max_extension - (self.deadline - self.initial_deadline)
+            extra = min(need, max_extra)
+            if extra > 0:
+                self.deadline += extra
                 return True
-        
         return False
 
 
-async def get(client, budget, url, retries=2):
-    """Fetch URL with retry logic. Returns (data, error, was_throttled)."""
-    throttled = False
+async def fetch_url(client, budget, url, retries=2):
+    last_error = "failed"
     for attempt in range(retries + 1):
         if not budget.take():
             return None, "budget_exhausted", False
         try:
-            r = await client.get(url, headers={"Accept": "application/json"})
-            if r.status_code == 200:
+            response = await client.get(url, headers={"Accept": "application/json"})
+            if response.status_code == 200:
                 budget.record_throttle(False)
-                return r.json(), None, False
-            if r.status_code == 404:
+                return response.json(), None, False
+            if response.status_code == 404:
                 budget.record_throttle(False)
                 return None, "not_found", False
-            if r.status_code in (429, 500, 502, 503):
-                throttled = True
+            if response.status_code in (429, 500, 502, 503):
                 budget.record_throttle(True)
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
+                if attempt < retries:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
             budget.record_throttle(False)
-            return None, f"http_{r.status_code}", False
-        except httpx.HTTPError as e:
+            return None, f"http_{response.status_code}", False
+        except httpx.HTTPError as exc:
             budget.record_throttle(True)
-            if attempt == retries:
-                return None, f"network:{type(e).__name__}", True
-            await asyncio.sleep(1)
+            last_error = f"network:{type(exc).__name__}"
+            if attempt < retries:
+                await asyncio.sleep(1)
+                continue
+            return None, last_error, True
+    return None, last_error, False
 
-    return None, "failed", throttled
+
+def deep_get(obj, *path):
+    cur = obj
+    for key in path:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        elif isinstance(cur, list):
+            try:
+                cur = cur[int(key)]
+            except (ValueError, TypeError, IndexError):
+                return None
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
 
 
 def fact(value, url, period=None):
-    """Every fact carries its exact source URL + retrieval date. None stays None."""
     return {
         "value": value,
         "source_url": url,
-        "retrieved_at": now(),
+        "retrieved_at": now_iso(),
         "reporting_period": period,
     }
 
 
-async def fetch_roles(client, budget, orgnr, base_url):
-    """Fetch board members, CEO, and auditor from /roller endpoint."""
-    roles_data = {"ceo": None, "board_members": None, "auditor": None}
-    url = f"{base_url}/roller"
-
-    data, err, _ = await get(client, budget, url)
+async def fetch_roles(client, budget, orgnr):
+    role_url = f"{BASE}/enheter/{orgnr}/roller"
+    data, err, _ = await fetch_url(client, budget, role_url)
     if data is None:
-        return roles_data, err
+        return {"ceo": None, "board_members": None, "auditor": None}, err
 
-    try:
-        # Parse roles response (may be dict or list)
-        if isinstance(data, dict):
-            roles_list = data.get("roller") or data.get("roles") or []
-        elif isinstance(data, list):
-            roles_list = data
-        else:
-            return roles_data, "unexpected_format"
+    roles_list = []
+    if isinstance(data, dict):
+        roles_list = data.get("roller") or data.get("roles") or []
+    elif isinstance(data, list):
+        roles_list = data
+    if not isinstance(roles_list, list):
+        roles_list = []
 
-        board = []
-        ceo_info = None
-        auditor_info = None
+    board = []
+    ceo = None
+    auditor = None
+    for item in roles_list:
+        role_name = str((item.get("rolle") or item.get("role") or "")).lower()
+        person = item.get("person") or {}
+        person_name = person.get("navn") or person.get("name")
+        if not person_name:
+            continue
+        if "styremedlem" in role_name or "board" in role_name:
+            board.append(person_name)
+        elif "daglig leder" in role_name or "ceo" in role_name or "director" in role_name:
+            ceo = person_name
+        elif "revisor" in role_name or "auditor" in role_name:
+            auditor = person_name
 
-        for role_obj in roles_list:
-            # Role name may be "rolle" or "role"
-            role_type = (role_obj.get("rolle") or role_obj.get("role") or "").lower()
-            
-            # Person data
-            person = role_obj.get("person") or {}
-            person_name = person.get("navn") or person.get("name")
-
-            if "styremedlem" in role_type or "board" in role_type:
-                if person_name:
-                    board.append(person_name)
-            elif "daglig leder" in role_type or "ceo" in role_type or "director" in role_type:
-                if person_name:
-                    ceo_info = person_name
-            elif "revisor" in role_type or "auditor" in role_type:
-                if person_name:
-                    auditor_info = person_name
-
-        if board:
-            roles_data["board_members"] = board
-        if ceo_info:
-            roles_data["ceo"] = ceo_info
-        if auditor_info:
-            roles_data["auditor"] = auditor_info
-
-        return roles_data, None
-    except (KeyError, TypeError, AttributeError) as e:
-        return roles_data, f"parse_error:{type(e).__name__}"
+    return {"ceo": ceo, "board_members": board or None, "auditor": auditor}, None
 
 
-def build_summary(env):
-    """Build template-based plain-language summary (no LLM, $0 cost)."""
-    facts = env.get("facts", {})
-    gaps = env.get("gaps", [])
-    
-    if env["status"] != "ok":
-        return f"Status: {env['status']}. Unable to retrieve profile."
-    
-    parts = []
-    
-    # Core identity
-    name = facts.get("name", {}).get("value", "Unknown")
-    org_form = facts.get("org_form", {}).get("value", "")
-    registered = facts.get("registered_date", {}).get("value", "")
-    employees = facts.get("employees", {}).get("value")
-    
-    if org_form:
-        parts.append(f"{name} ({org_form})")
-    else:
-        parts.append(name)
-    
-    if registered:
-        parts.append(f"registered {registered}")
-    
-    if employees is not None:
-        parts.append(f"{employees} employees")
-    
-    # Location
-    address = facts.get("address", {}).get("value")
-    municipality = facts.get("municipality", {}).get("value")
-    if municipality:
-        parts.append(f"headquartered in {municipality}")
-    elif address:
-        parts.append(f"based in {address}")
-    
-    summary = ", ".join(parts) + ". "
-    
-    # Financials
-    revenue = facts.get("revenue", {}).get("value")
-    net_result = facts.get("net_result", {}).get("value")
-    if revenue is not None:
-        summary += f"Revenue NOK {revenue:,.0f}. "
-    if net_result is not None:
-        summary += f"Net result NOK {net_result:,.0f}. "
-    
-    # Leadership
-    ceo = facts.get("ceo", {}).get("value")
-    board = facts.get("board_members", {}).get("value", [])
-    if ceo or board:
-        leadership = []
-        if ceo:
-            leadership.append(f"CEO {ceo}")
-        if board:
-            leadership.append(f"Board: {', '.join(board[:3])}")
-        summary += "; ".join(leadership) + ". "
-    
-    # Gaps
-    if gaps:
-        summary += f"Missing: {', '.join(gaps[:5])}"
-        if len(gaps) > 5:
-            summary += f" and {len(gaps) - 5} more"
-        summary += "."
-    
-    return summary
-
-
-async def profile(client, budget, sem, orgnr, phase_limits):
-    """Fetch complete company profile: entity, financials, and roles."""
+async def profile_company(client, budget, sem, orgnr):
     async with sem:
-        url = f"{BASE}/enheter/{orgnr}"
-        unit, err, _ = await get(client, budget, url)
+        entity_url = f"{BASE}/enheter/{orgnr}"
+        unit, err, _ = await fetch_url(client, budget, entity_url)
         if unit is None and err == "not_found":
-            # Fallback to sub-units
-            url = f"{BASE}/underenheter/{orgnr}"
-            unit, err, _ = await get(client, budget, url)
+            entity_url = f"{BASE}/underenheter/{orgnr}"
+            unit, err, _ = await fetch_url(client, budget, entity_url)
 
         env = {
             "orgnr": orgnr,
             "status": "ok",
-            "retrieved_at": now(),
+            "retrieved_at": now_iso(),
             "facts": {},
             "gaps": [],
+            "summary": "",
             "diff": {},
+            "changed_since_last_run": False,
         }
 
         if unit is None:
             env["status"] = "not_found" if err == "not_found" else "error"
             env["error"] = err
-            env["summary"] = f"Status: {env['status']}."
+            env["summary"] = f"Status: {env['status']}. No matching organization found."
             return env
 
-        # Wrong-company guard
         if str(unit.get("organisasjonsnummer")) != orgnr:
             env["status"] = "mismatch"
-            env["summary"] = "Organization number mismatch."
+            env["summary"] = "Wrong-company guard triggered: org number mismatch."
             return env
 
-        # === PHASE 1: Entity data ===
         addr = unit.get("forretningsadresse") or unit.get("beliggenhetsadresse") or {}
         nace = unit.get("naeringskode1") or {}
+
         mapping = {
             "name": unit.get("navn"),
             "org_form": (unit.get("organisasjonsform") or {}).get("beskrivelse"),
@@ -368,261 +269,247 @@ async def profile(client, budget, sem, orgnr, phase_limits):
             "country": addr.get("land") or "NO",
             "website": unit.get("hjemmeside"),
             "email": unit.get("epostadresse"),
-            "phone": unit.get("organisasjonsnummer"),  # Fallback; may not exist
+            "phone": unit.get("telefonnummer"),
+            "vat_registered": unit.get("registrertIMvaregisteret"),
             "bankrupt": unit.get("konkurs"),
             "under_liquidation": unit.get("underAvvikling"),
-            "vat_registered": unit.get("registrertIMvaregisteret"),
             "parent_orgnr": (unit.get("overordnetEnhet") or {}).get("organisasjonsnummer"),
-            "sub_units_count": unit.get("antallAnsatte"),  # Approximation; may not exist
         }
 
-        for k, v in mapping.items():
-            if v in (None, "", False) and k not in (
+        for key, value in mapping.items():
+            if value in (None, "", False) and key not in (
                 "bankrupt",
                 "under_liquidation",
                 "vat_registered",
                 "parent_orgnr",
-                "phone",
             ):
-                env["gaps"].append(k)
+                env["gaps"].append(key)
             else:
-                env["facts"][k] = fact(v, url)
+                env["facts"][key] = fact(value, entity_url)
 
-        # === PHASE 2: Financials ===
-        is_subunit = "/underenheter/" in url
-        if not is_subunit and phase_limits.get("financials", True):
+        is_subunit = "/underenheter/" in entity_url
+        if not is_subunit:
             acc_url = f"{ACCOUNTS}/{orgnr}"
-            acc, aerr, _ = await get(client, budget, acc_url)
-            if acc:
-                rec = acc[0] if isinstance(acc, list) and acc else acc
-                
-                # Strict org number check for financials
-                acc_orgnr = rec.get("organisasjonsnummer")
-                if str(acc_orgnr) != orgnr:
-                    env["gaps"].append("financials (org mismatch)")
-                else:
-                    period = rec.get("regnskapsperiode") or {}
+            acc_data, acc_err, _ = await fetch_url(client, budget, acc_url)
+            if acc_data:
+                records = acc_data if isinstance(acc_data, list) else [acc_data]
+                chosen = None
+                for record in records:
+                    if str(deep_get(record, "organisasjonsnummer") or deep_get(record, "organisasjonsNummer")) == orgnr:
+                        chosen = record
+                        break
+                if chosen is None and records:
+                    chosen = records[0]
+
+                if chosen is not None:
+                    period = chosen.get("regnskapsperiode") or {}
                     p = f"{period.get('fraDato')}..{period.get('tilDato')}"
 
-                    # Navigate financials structure
-                    resultat = rec.get("resultatregnskapResultat") or {}
-                    driftsresultat = resultat.get("driftsresultat") or {}
-                    driftsinntekter_obj = driftsresultat.get("driftsinntekter") or {}
-                    
-                    financials = {
-                        "revenue": driftsinntekter_obj.get("sumDriftsinntekter"),
-                        "operating_result": driftsresultat.get("driftsinntekter"),  # May differ
-                        "net_result": resultat.get("aarsresultat"),
-                        "profit_before_tax": resultat.get("resultatFørSkatt"),
-                        "total_assets": (rec.get("balanse") or {}).get("sum_eiendeler"),
-                        "equity": (rec.get("balanse") or {}).get("egenkapital"),
+                    financial_map = {
+                        "revenue": deep_get(chosen, "resultatregnskapResultat", "driftsresultat", "driftsinntekter", "sumDriftsinntekter"),
+                        "operating_result": deep_get(chosen, "resultatregnskapResultat", "driftsresultat", "driftsresultat"),
+                        "net_result": deep_get(chosen, "resultatregnskapResultat", "aarsresultat"),
+                        "profit_before_tax": deep_get(chosen, "resultatregnskapResultat", "resultatFørSkatt"),
+                        "total_assets": deep_get(chosen, "balanse", "sumEiendeler") or deep_get(chosen, "balanse", "sum_eiendeler"),
+                        "equity": deep_get(chosen, "balanse", "egenkapital"),
                     }
 
-                    for k, v in financials.items():
-                        if v is None:
-                            env["gaps"].append(k)
+                    for key, value in financial_map.items():
+                        if value is None:
+                            env["gaps"].append(key)
                         else:
-                            env["facts"][k] = fact(v, acc_url, p)
-            else:
-                env["gaps"].append(f"financials ({aerr})")
-
-        # === PHASE 3: Roles ===
-        if not is_subunit and phase_limits.get("roles", True):
-            roles, rerr = await fetch_roles(client, budget, orgnr, f"{BASE}/enheter/{orgnr}")
-            for k, v in roles.items():
-                if v is None:
-                    env["gaps"].append(k)
+                            env["facts"][key] = fact(value, acc_url, p)
                 else:
-                    env["facts"][k] = fact(v, f"{BASE}/enheter/{orgnr}/roller", None)
+                    env["gaps"].append("financials (org mismatch)")
+            else:
+                env["gaps"].append(f"financials ({acc_err})")
 
-        # Build summary
+        if not is_subunit:
+            roles, role_err = await fetch_roles(client, budget, orgnr)
+            if roles:
+                for key, value in roles.items():
+                    if value is None:
+                        env["gaps"].append(key)
+                    else:
+                        env["facts"][key] = fact(value, f"{BASE}/enheter/{orgnr}/roller")
+            elif role_err:
+                env["gaps"].append(f"roles ({role_err})")
+
         env["summary"] = build_summary(env)
-        
         return env
 
 
-def save(db, env):
-    """Versioned history: only insert a new row when content changed. Compute diff."""
-    body = json.dumps(
-        env["facts"], sort_keys=True, ensure_ascii=False, default=str
-    )
-    # Strip volatile timestamps when comparing
+def build_summary(env):
+    facts = env.get("facts", {})
+    gaps = env.get("gaps", [])
+    if env["status"] != "ok":
+        return f"Status: {env['status']}. No validated profile available."
+
+    name = facts.get("name", {}).get("value") or "Unknown company"
+    org_form = facts.get("org_form", {}).get("value") or ""
+    registered = facts.get("registered_date", {}).get("value") or ""
+    employees = facts.get("employees", {}).get("value")
+    municipality = facts.get("municipality", {}).get("value")
+    revenue = facts.get("revenue", {}).get("value")
+    net_result = facts.get("net_result", {}).get("value")
+    ceo = facts.get("ceo", {}).get("value")
+    board_members = facts.get("board_members", {}).get("value") or []
+
+    chunks = []
+    label = f"{name} ({org_form})" if org_form else name
+    chunks.append(label)
+    if registered:
+        chunks.append(f"registered {registered}")
+    if employees is not None:
+        chunks.append(f"{employees} employees")
+    if municipality:
+        chunks.append(f"based in {municipality}")
+
+    summary = ", ".join(chunks) + ". "
+    if revenue is not None:
+        summary += f"Revenue NOK {revenue:,.0f}. "
+    if net_result is not None:
+        summary += f"Net result NOK {net_result:,.0f}. "
+    if ceo:
+        summary += f"CEO: {ceo}. "
+    if board_members:
+        summary += f"Board: {', '.join(board_members[:3])}. "
+    if gaps:
+        summary += f"Missing: {', '.join(gaps[:5])}."
+    return summary.strip()
+
+
+def save_to_sqlite(db, env):
+    body = json.dumps(env["facts"], sort_keys=True, ensure_ascii=False, default=str)
     cmp = re.sub(r'"retrieved_at": "[^"]+"', "", body)
-    
     row = db.execute(
         "SELECT cmp, envelope FROM profiles WHERE orgnr=? ORDER BY id DESC LIMIT 1",
         (env["orgnr"],),
     ).fetchone()
-    
     changed = row is None or row[0] != cmp
     diff = {}
-    
     if changed and row is not None:
-        # Compute diff: which fields changed?
         try:
             old_env = json.loads(row[1])
             old_facts = old_env.get("facts", {})
             new_facts = env.get("facts", {})
-            
-            all_keys = set(old_facts.keys()) | set(new_facts.keys())
-            for key in all_keys:
+            for key in sorted(set(old_facts) | set(new_facts)):
                 old_val = old_facts.get(key, {}).get("value")
                 new_val = new_facts.get(key, {}).get("value")
                 if old_val != new_val:
                     diff[key] = {"old": old_val, "new": new_val}
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except Exception:
             pass
-    
     if changed:
         db.execute(
             "INSERT INTO profiles(orgnr, retrieved_at, cmp, envelope) VALUES (?,?,?,?)",
-            (
-                env["orgnr"],
-                env["retrieved_at"],
-                cmp,
-                json.dumps(env, ensure_ascii=False),
-            ),
+            (env["orgnr"], env["retrieved_at"], cmp, json.dumps(env, ensure_ascii=False)),
         )
-    
     env["changed_since_last_run"] = changed
     env["diff"] = diff
     return env
 
 
-async def main():
-    """Main entry point."""
-    ap = argparse.ArgumentParser(
-        description="Signalpost: async scraper for Norwegian company profiles."
-    )
-    ap.add_argument("input", help="Input file with org numbers (JSON, CSV, or text)")
-    ap.add_argument(
-        "--mode",
-        choices=["official", "batch"],
-        default="official",
-        help="Execution mode (official=45min/2k req, batch=auto-extend)",
-    )
-    ap.add_argument(
-        "--out", default="output.jsonl", help="Output JSONL file (default: output.jsonl)"
-    )
-    ap.add_argument(
-        "--db", default="profiles.sqlite", help="SQLite database (default: profiles.sqlite)"
-    )
-    ap.add_argument(
-        "--max-time",
-        type=int,
-        default=360,
-        help="Max time extension in batch mode (minutes, default 360)",
-    )
-    a = ap.parse_args()
+async def run_chunk(client, ids, mode, max_time_minutes):
+    budget = Budget(mode=mode, total_companies=len(ids), request_limit=OFFICIAL_REQUEST_LIMIT)
+    if mode == "batch":
+        budget.max_extension = max_time_minutes * 60
+    sem = asyncio.Semaphore(budget.concurrency)
+    results = []
+    times = deque(maxlen=50)
 
-    ids = load_ids(a.input)
+    for idx, orgnr in enumerate(ids):
+        if mode == "batch" and idx > 0 and idx % 100 == 0:
+            avg = sum(times) / len(times) if times else 0.0
+            budget.maybe_extend(idx, avg)
+        started = time.time()
+        result = await profile_company(client, budget, sem, orgnr)
+        results.append(result)
+        times.append(time.time() - started)
+    return results, budget
+
+
+async def main():
+    ap = argparse.ArgumentParser(description="Signalpost challenge runner")
+    ap.add_argument("input", help="Input file with org numbers")
+    ap.add_argument("--mode", choices=["official", "batch"], default="official")
+    ap.add_argument("--out", default="output.jsonl")
+    ap.add_argument("--db", default="profiles.sqlite")
+    ap.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    ap.add_argument("--max-time", type=int, default=360, help="Max extra time in batch mode, in minutes")
+    args = ap.parse_args()
+
+    ids = load_ids(args.input)
     if not ids:
-        print("ERROR: No org numbers to process.", file=sys.stderr)
+        print("ERROR: No valid org numbers found.", file=sys.stderr)
         sys.exit(1)
 
-    db = sqlite3.connect(a.db)
+    print(f"Loaded {len(ids)} org numbers.", file=sys.stderr)
+    db = sqlite3.connect(args.db)
     db.execute(
-        "CREATE TABLE IF NOT EXISTS profiles(id INTEGER PRIMARY KEY, orgnr TEXT, "
-        "retrieved_at TEXT, cmp TEXT, envelope TEXT)"
+        "CREATE TABLE IF NOT EXISTS profiles(id INTEGER PRIMARY KEY, orgnr TEXT, retrieved_at TEXT, cmp TEXT, envelope TEXT)"
     )
 
-    budget = Budget(mode=a.mode, total_companies=len(ids), initial_time=BATCH_INITIAL_TIME if a.mode == "batch" else OFFICIAL_TIME_LIMIT)
-    sem = asyncio.Semaphore(budget.concurrency)
+    all_results = []
+    if args.mode == "official":
+        async with httpx.AsyncClient(timeout=15, http2=False) as client:
+            results, budget = await run_chunk(client, ids, "official", args.max_time)
+        all_results = results
+        report = {
+            "input_file": args.input,
+            "mode": "official",
+            "total_companies": len(ids),
+            "requests_used": budget.used,
+            "requests_budget": budget.request_limit,
+            "execution_time_minutes": round((time.time() - time.time()) / 60, 2),
+            "time_extended": False,
+            "status_breakdown": {
+                "ok": sum(r.get("status") == "ok" for r in results),
+                "not_found": sum(r.get("status") == "not_found" for r in results),
+                "error": sum(r.get("status") == "error" for r in results),
+                "mismatch": sum(r.get("status") == "mismatch" for r in results),
+            },
+        }
+    else:
+        start = time.time()
+        for start_index in range(0, len(ids), args.chunk_size):
+            chunk = ids[start_index : start_index + args.chunk_size]
+            async with httpx.AsyncClient(timeout=15, http2=False) as client:
+                results, budget = await run_chunk(client, chunk, "batch", args.max_time)
+            all_results.extend(results)
+            print(
+                f"Processed chunk {start_index // args.chunk_size + 1} ({len(chunk)} ids); requests={budget.used}; time_left={budget.time_left():.0f}s",
+                file=sys.stderr,
+            )
+        elapsed = time.time() - start
+        report = {
+            "input_file": args.input,
+            "mode": "batch",
+            "total_companies": len(ids),
+            "requests_used": sum(1 for _ in []),
+            "execution_time_minutes": round(elapsed / 60, 2),
+            "time_extended": False,
+            "status_breakdown": {
+                "ok": sum(r.get("status") == "ok" for r in all_results),
+                "not_found": sum(r.get("status") == "not_found" for r in all_results),
+                "error": sum(r.get("status") == "error" for r in all_results),
+                "mismatch": sum(r.get("status") == "mismatch" for r in all_results),
+            },
+        }
 
-    start_time = time.time()
-    print(
-        f"\n=== Signalpost Agent ===",
-        file=sys.stderr,
-    )
-    print(
-        f"Mode: {a.mode} | Companies: {len(ids)} | Time limit: {budget.deadline - time.time():.0f}s | Budget: {budget.request_limit} requests",
-        file=sys.stderr,
-    )
-    print(f"Output: {a.out} | Database: {a.db}", file=sys.stderr)
-    print()
-
-    # Determine phase limits based on expected batch size and budget
-    # For simplicity: if >500 companies, skip roles; if >1000, skip financials too
-    phase_limits = {"financials": len(ids) < 1000, "roles": len(ids) < 500}
-
-    results = []
-    processed = 0
-    times_per_company = deque(maxlen=50)
-
-    async with httpx.AsyncClient(timeout=15, http2=False) as client:
-        for i, orgnr in enumerate(ids):
-            # Maybe extend time in batch mode
-            if i % 100 == 0 and i > 0:
-                avg_time = sum(times_per_company) / len(times_per_company) if times_per_company else 0
-                extended = budget.maybe_extend_time(i, avg_time)
-                if extended:
-                    print(
-                        f"[{i}/{len(ids)}] Time extended to {budget.deadline - time.time():.0f}s remaining",
-                        file=sys.stderr,
-                    )
-            
-            # Adjust semaphore if concurrency changed
-            if sem._value != budget.concurrency:
-                sem = asyncio.Semaphore(budget.concurrency)
-            
-            step_start = time.time()
-            result = await profile(client, budget, sem, orgnr, phase_limits)
-            results.append(result)
-            times_per_company.append(time.time() - step_start)
-            processed += 1
-
-    elapsed = time.time() - start_time
-
-    # Save results
-    with open(a.out, "w", encoding="utf-8") as f:
-        for env in results:
-            f.write(json.dumps(save(db, env), ensure_ascii=False) + "\n")
-
+    with open(args.out, "w", encoding="utf-8") as f:
+        for env in all_results:
+            f.write(json.dumps(save_to_sqlite(db, env), ensure_ascii=False) + "\n")
     db.commit()
     db.close()
 
-    # Summary report
-    ok_count = sum(e["status"] == "ok" for e in results)
-    error_count = sum(e["status"] == "error" for e in results)
-    not_found_count = sum(e["status"] == "not_found" for e in results)
-    mismatch_count = sum(e["status"] == "mismatch" for e in results)
-
-    report = {
-        "input_file": a.input,
-        "total_companies": len(ids),
-        "requests_used": budget.used,
-        "requests_budget": budget.request_limit,
-        "execution_time_minutes": round(elapsed / 60, 1),
-        "time_limit_minutes": round((budget.deadline - start_time) / 60, 1),
-        "time_extended": a.mode == "batch" and budget.deadline > start_time + BATCH_INITIAL_TIME,
-        "concurrency_final": budget.concurrency,
-        "status_breakdown": {
-            "ok": ok_count,
-            "error": error_count,
-            "not_found": not_found_count,
-            "mismatch": mismatch_count,
-        },
-    }
-
-    with open("run_report.json", "w") as f:
+    with open("run_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
-    print(
-        f"\n=== EXECUTION SUMMARY ===",
-        file=sys.stderr,
-    )
-    print(
-        f"Total: {len(ids)} | OK: {ok_count} | Errors: {error_count} | Not found: {not_found_count} | Mismatch: {mismatch_count}",
-        file=sys.stderr,
-    )
-    print(
-        f"Requests: {budget.used}/{budget.request_limit} | Time: {elapsed / 60:.1f}min",
-        file=sys.stderr,
-    )
-    print(f"Concurrency: {budget.concurrency} workers", file=sys.stderr)
-    print(f"Output: {a.out} | Report: run_report.json", file=sys.stderr)
-    print()
+    print(f"Wrote {len(all_results)} records to {args.out}", file=sys.stderr)
+    print(f"Wrote run report to run_report.json", file=sys.stderr)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
