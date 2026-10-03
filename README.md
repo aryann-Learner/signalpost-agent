@@ -63,7 +63,7 @@ The script writes JSONL, one profile per line:
 }
 ```
 
-## Why this is built to win
+## What it makes different 
 
 1. **Coverage** - captures core Brreg entity data, financial lines, and roles
 2. **Precision** - strict org matching and exact source links prevent wrong-company failures
